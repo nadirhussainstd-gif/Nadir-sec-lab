@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Nadir@sec-lab  -  Multi-threaded TCP Port Scanner
+Owner  : Nadir Hussain
+Purpose: Educational / authorized security testing only.
+License: MIT
+"""
+
+import argparse
+import ipaddress
+import os
+import queue
+import socket
+import sys
+import threading
+import time
+from datetime import datetime
+
+try:
+    import resource
+except ImportError:  # non-Linux
+    resource = None
+
+VERSION = "1.0.0"
+OWNER = "Nadir Hussain"
+TOOL = "Nadir@sec-lab"
+
+# ───────────────────────── colours ─────────────────────────
+class C:
+    G = "\033[92m"; DG = "\033[32m"; R = "\033[91m"; Y = "\033[93m"
+    CY = "\033[96m"; M = "\033[95m"; W = "\033[97m"; GR = "\033[90m"
+    B = "\033[1m"; X = "\033[0m"
+
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for k in list(vars(C)):
+        if not k.startswith("_"):
+            setattr(C, k, "")
+
+BANNER = r"""
+███╗   ██╗ █████╗ ██████╗ ██╗██████╗ 
+████╗  ██║██╔══██╗██╔══██╗██║██╔══██╗
+██╔██╗ ██║███████║██║  ██║██║██████╔╝
+██║╚██╗██║██╔══██║██║  ██║██║██╔══██╗
+██║ ╚████║██║  ██║██████╔╝██║██║  ██║
+╚═╝  ╚═══╝╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═╝"""
+
+def show_banner():
+    shades = [C.G, C.G, C.DG, C.DG, C.GR, C.GR]
+    print()
+    for i, line in enumerate(BANNER.strip("\n").splitlines()):
+        print("  " + C.B + shades[i % len(shades)] + line + C.X)
+    w = 62
+    print(f"  {C.CY}╔{'═'*w}╗{C.X}")
+    print(f"  {C.CY}║{C.X} {C.B}{C.G}{TOOL:<24}{C.X}{C.GR}v{VERSION:<10}{C.X}"
+          f"{C.W}Owner: {C.Y}{OWNER:<{w-43}}{C.X}{C.CY}║{C.X}")
+    print(f"  {C.CY}║{C.X} {C.M}{'TCP Port Scanner  //  65535 ports  //  service detect':<{w-1}}{C.X}{C.CY}║{C.X}")
+    print(f"  {C.CY}╚{'═'*w}╝{C.X}")
+    print(f"  {C.R}[!]{C.GR} Scan only systems you own or have written permission to test.{C.X}\n")
+
+# ───────────────────────── services ─────────────────────────
+EXTRA = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 67: "dhcp",
+    80: "http", 110: "pop3", 111: "rpcbind", 135: "msrpc", 139: "netbios-ssn",
+    143: "imap", 389: "ldap", 443: "https", 445: "microsoft-ds", 465: "smtps",
+    587: "submission", 631: "ipp", 993: "imaps", 995: "pop3s", 1080: "socks",
+    1433: "mssql", 1521: "oracle", 2049: "nfs", 2375: "docker", 3000: "node/dev",
+    3306: "mysql", 3389: "rdp", 4444: "metasploit/krb", 5000: "flask/upnp",
+    5432: "postgresql", 5900: "vnc", 5985: "winrm", 6379: "redis",
+    8000: "http-alt", 8080: "http-proxy", 8443: "https-alt", 8888: "http-alt",
+    9000: "php-fpm/portainer", 9200: "elasticsearch", 27017: "mongodb",
+}
+
+def service_name(port):
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return EXTRA.get(port, "unknown")
+
+# ───────────────────────── scanner ─────────────────────────
+class Scanner:
+    def __init__(self, ip, ports, threads, timeout, grab):
+        self.ip, self.timeout, self.grab = ip, timeout, grab
+        self.q = queue.Queue()
+        for p in ports:
+            self.q.put(p)
+        self.total = len(ports)
+        self.threads = min(threads, self.total)
+        self.done = 0
+        self.open = []
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+
+    def banner(self, s, port):
+        try:
+            s.settimeout(1.0)
+            if port in (80, 8000, 8080, 8888, 8443, 443):
+                s.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+            data = s.recv(128).decode(errors="ignore").strip().splitlines()
+            return data[0][:50] if data else ""
+        except OSError:
+            return ""
+
+    def worker(self):
+        while not self.stop.is_set():
+            try:
+                port = self.q.get_nowait()
+            except queue.Empty:
+                return
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(self.timeout)
+            try:
+                if s.connect_ex((self.ip, port)) == 0:
+                    info = self.banner(s, port) if self.grab else ""
+                    with self.lock:
+                        self.open.append((port, service_name(port), info))
+            except OSError:
+                pass
+            finally:
+                s.close()
+                with self.lock:
+                    self.done += 1
+
+    def run(self):
+        ts = [threading.Thread(target=self.worker, daemon=True) for _ in range(self.threads)]
+        for t in ts:
+            t.start()
+        start = time.time()
+        try:
+            while any(t.is_alive() for t in ts):
+                self.progress(start)
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            self.stop.set()
+            print(f"\n  {C.Y}[!] Interrupted — showing results so far...{C.X}")
+        self.progress(start)
+        print()
+        return sorted(self.open), time.time() - start
+
+    def progress(self, start):
+        with self.lock:
+            d = self.done
+        pct = d / self.total if self.total else 1
+        n = 30
+        bar = "█" * int(n * pct) + "░" * (n - int(n * pct))
+        el = time.time() - start
+        rate = d / el if el > 0 else 0
+        sys.stdout.write(
+            f"\r  {C.CY}[{C.G}{bar}{C.CY}]{C.W} {pct*100:5.1f}% "
+            f"{C.GR}{d}/{self.total}  {rate:,.0f} p/s  "
+            f"{C.G}open:{len(self.open)}{C.X}   ")
+        sys.stdout.flush()
+
+# ───────────────────────── helpers ─────────────────────────
+def parse_ports(spec):
+    ports = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            ports.update(range(a, b + 1))
+        elif part:
+            ports.add(int(part))
+    if not ports or min(ports) < 1 or max(ports) > 65535:
+        raise ValueError("ports must be within 1-65535")
+    return sorted(ports)
+
+def raise_fd_limit(want):
+    if resource is None:
+        return want
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(hard, want + 100) if hard != resource.RLIM_INFINITY else want + 100
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+        return max(10, min(want, soft - 50))
+    except (ValueError, OSError):
+        return want
+
+def is_own_target(ip):
+    a = ipaddress.ip_address(ip)
+    return a.is_loopback or a.is_private
+
+def print_table(results, ip, host):
+    print(f"  {C.CY}╔{'═'*8}╦{'═'*8}╦{'═'*22}╦{'═'*30}╗{C.X}")
+    print(f"  {C.CY}║{C.B}{C.Y} {'PORT':<7}{C.CY}║{C.Y} {'STATE':<7}{C.CY}║{C.Y} {'SERVICE':<21}{C.CY}║{C.Y} {'BANNER':<29}{C.CY}║{C.X}")
+    print(f"  {C.CY}╠{'═'*8}╬{'═'*8}╬{'═'*22}╬{'═'*30}╣{C.X}")
+    if not results:
+        print(f"  {C.CY}║{C.R} {'No open ports found':<69}{C.CY}║{C.X}")
+    for port, svc, info in results:
+        print(f"  {C.CY}║{C.G} {port:<7}{C.CY}║{C.G} {'open':<7}{C.CY}║{C.W} {svc[:20]:<21}{C.CY}║{C.GR} {info[:28]:<29}{C.CY}║{C.X}")
+    print(f"  {C.CY}╚{'═'*8}╩{'═'*8}╩{'═'*22}╩{'═'*30}╝{C.X}")
+
+def save_report(path, host, ip, results, scanned, secs):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{TOOL} v{VERSION} — Owner: {OWNER}\n")
+        f.write(f"Date   : {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        f.write(f"Target : {host} ({ip})\nScanned: {scanned} ports in {secs:.2f}s\n\n")
+        f.write(f"{'PORT':<8}{'STATE':<8}{'SERVICE':<22}BANNER\n")
+        for port, svc, info in results:
+            f.write(f"{port:<8}{'open':<8}{svc:<22}{info}\n")
+
+# ───────────────────────── main ─────────────────────────
+def main():
+    ap = argparse.ArgumentParser(
+        prog=TOOL, description=f"{TOOL} — TCP port scanner by {OWNER}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n  Nadir@sec-lab 127.0.0.1\n  Nadir@sec-lab 192.168.1.10 -p 1-1024 -b\n"
+               "  Nadir@sec-lab scanme.nmap.org -t 800 -o report.txt")
+    ap.add_argument("target", nargs="?", help="IP address or hostname")
+    ap.add_argument("-p", "--ports", default="1-65535", help="ports, e.g. 22,80,1-1000 (default: all 65535)")
+    ap.add_argument("-t", "--threads", type=int, default=500, help="threads (default 500)")
+    ap.add_argument("-T", "--timeout", type=float, default=0.8, help="timeout seconds (default 0.8)")
+    ap.add_argument("-b", "--banner", action="store_true", help="grab service banners")
+    ap.add_argument("-o", "--output", help="save report to file")
+    ap.add_argument("-y", "--yes", action="store_true", help="skip authorization prompt")
+    ap.add_argument("-v", "--version", action="version", version=f"{TOOL} v{VERSION}")
+    args = ap.parse_args()
+
+    show_banner()
+    if not args.target:
+        try:
+            args.target = input(f"  {C.G}Nadir@sec-lab{C.W}:{C.CY}~{C.W}$ {C.Y}target > {C.X}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); return 1
+    if not args.target:
+        return 1
+
+    try:
+        ip = socket.gethostbyname(args.target)
+        ports = parse_ports(args.ports)
+    except (socket.gaierror, ValueError) as e:
+        print(f"  {C.R}[x] {e}{C.X}"); return 1
+
+    if not args.yes and not is_own_target(ip):
+        ans = input(f"  {C.Y}[?] {ip} is not a private/local address. Do you have permission to scan it? [y/N] {C.X}")
+        if ans.strip().lower() != "y":
+            print(f"  {C.R}[x] Aborted.{C.X}"); return 1
+
+    threads = raise_fd_limit(args.threads)
+    print(f"  {C.G}[+]{C.W} Target  : {C.Y}{args.target} {C.GR}({ip}){C.X}")
+    print(f"  {C.G}[+]{C.W} Ports   : {C.Y}{len(ports)}{C.W}   Threads: {C.Y}{threads}{C.W}   Timeout: {C.Y}{args.timeout}s{C.X}")
+    print(f"  {C.G}[+]{C.W} Started : {C.GR}{datetime.now():%Y-%m-%d %H:%M:%S}{C.X}\n")
+
+    results, secs = Scanner(ip, ports, threads, args.timeout, args.banner).run()
+    print_table(results, ip, args.target)
+    print(f"\n  {C.G}[✓]{C.W} Done: {C.G}{len(results)} open{C.W} / {len(ports)} scanned in {C.Y}{secs:.2f}s{C.X}")
+
+    if args.output:
+        save_report(args.output, args.target, ip, results, len(ports), secs)
+        print(f"  {C.G}[✓]{C.W} Report saved: {C.Y}{args.output}{C.X}")
+    print(f"\n  {C.GR}// {TOOL} — {OWNER}{C.X}\n")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
