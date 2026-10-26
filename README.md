@@ -11,8 +11,8 @@ Hacker-style multi-threaded TCP port scanner. Scans all **65535 ports**, shows o
 ## Install
 
 ```bash
-git clone https://github.com/nadirhussainstd-gif/Nadir-sec-lab.git
-cd "Nadir-sec-lab"
+git clone https://github.com/<your-username>/Nadir@sec-lab.git
+cd "Nadir@sec-lab"
 chmod +x install.sh && ./install.sh
 ```
 
